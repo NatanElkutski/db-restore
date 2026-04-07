@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gzip \
     && rm -rf /var/lib/apt/lists/*
 
+ENV AWS_PAGER=""
+
 WORKDIR /app
 COPY restore.sh      /app/restore.sh
 COPY list-backups.sh /app/list-backups.sh
