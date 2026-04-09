@@ -1,168 +1,73 @@
-# DB Restore Runbook
+# 🗄️ Railway Database Restore Guide
 
-How to restore a Postgres dump from Cloudflare R2 into the Railway Postgres database, using the `db-restore` toolbox service on Railway.
-
-> Assumes one-time setup is already done: GitHub repo with the scripts, `db-restore` service deployed on Railway, R2 and `DATABASE_URL` env variables set, Railway CLI installed locally (`npm install -g @railway/cli`).
+This guide covers how to manage, recreate, and restore your PostgreSQL database using the `db-restore` service and the `manage.sh` script.
 
 ---
 
-## ⚠️ Before you run this
-
-- [ ] Confirm you actually want to restore. This **drops and replaces** the `public` schema on the target database. Anything not in the dump is gone.
-- [ ] Confirm `DATABASE_URL` on the `db-restore` service points to the **correct** Postgres (prod vs. test). Check it in the Railway dashboard → `db-restore` → Variables tab before proceeding.
-- [ ] Tell your team production is going into maintenance, if applicable.
-- [ ] Know which dump you want to restore from — usually the most recent one from **before** the incident, not necessarily the absolute newest.
+## 🛠 Prerequisites
+* **Railway CLI** installed and authenticated (`railway login`).
+* **Linked Project**: Ensure you are in your project folder and run `railway link`.
 
 ---
 
-## Step 1 — Open PowerShell
-
-Start menu → **PowerShell** (regular, no admin needed).
-
-## Step 2 — Log in to Railway
-
-```powershell
-railway login
+## 1️⃣ Verify Your Environment
+Before doing anything destructive, always verify you are in the **Staging** environment.
+```bash
+railway status
 ```
 
-A browser tab opens. Click **Authorize**. Come back to PowerShell — you should see a success message.
-
-If you logged in recently, this may be a no-op and skip straight to confirming you're already logged in. That's fine.
-
-## Step 3 — SSH into the `db-restore` service
-
-If you already linked a folder with `railway link` previously, just `cd` to it and run:
-
-```powershell
-cd C:\railway-restore
-railway ssh
+## 2️⃣ Access the Restore Toolbox
+Since you cannot run the R2-streaming scripts from your local Windows machine, you must enter the "Restore" container.
+```bash
+railway ssh --service db-restore
+```
+*Once inside, verify you are in the right container:*
+```bash
+echo $RAILWAY_SERVICE_NAME
+# Should output: db-restore
 ```
 
-**If that doesn't work** (or you haven't linked a folder), use the dashboard shortcut:
-
-1. Go to railway.app → open your project.
-2. **Right-click** the `db-restore` service tile → **Copy SSH Command**.
-3. Paste into PowerShell and press enter.
-
-You're in when your prompt changes to something like:
-
-```
-root@abc123:/app#
-```
-
-That prefix means you're now inside the Railway container, not on Windows anymore.
-
-## Step 4 — Disable the AWS CLI pager (for this session)
-
-The container's `aws` CLI tries to pipe output through `less`, which isn't installed. Turn it off:
+## 3️⃣ Create/Recreate the Database
+If you have dropped your database or it doesn't exist, you must recreate it. Since your `$DATABASE_URL` might point to a non-existent DB, we connect to the system `postgres` database to run the create command.
 
 ```bash
-export AWS_PAGER=""
+psql "${DATABASE_URL%/*}/postgres" -c "CREATE DATABASE railway;"
 ```
+> [!TIP]
+> Change `railway` to your actual database name (e.g., `pwrdesk_backup`) if you are using a custom name.
 
-No output means success.
+## 4️⃣ Manage & Restore Backups
+Use the `manage.sh` script to interact with your Cloudflare R2 backups.
 
-> **Permanent fix:** add `ENV AWS_PAGER=""` to the `Dockerfile` in the GitHub repo and push — Railway rebuilds and you never need this step again.
-
-## Step 5 — List available backups
-
+### List all available backups
 ```bash
-./list-backups.sh
+./manage.sh list
 ```
 
-You should see a table of dump files in the R2 bucket, newest first, with timestamps and sizes. Something like:
-
-```
-|  2026-04-07T23:00:14+00:00 |  4821334 |  backups/2026-04-07.sql.gz  |
-|  2026-04-06T23:00:09+00:00 |  4805112 |  backups/2026-04-06.sql.gz  |
-...
-```
-
-**Copy the key** (the last column) of the dump you want to restore.
-
-## Step 6 — Run the restore
-
+### Restore the LATEST backup
+This is the fastest "one-click" way to get the most recent data.
 ```bash
-./restore.sh backups/2026-04-07.sql.gz
+./manage.sh restore
 ```
 
-Replace the filename with the key you copied.
-
-The script will:
-
-1. Confirm the dump exists in R2.
-2. Show a warning with the target database (credentials masked).
-3. Ask you to type `RESTORE` to confirm.
-4. Drop + recreate the `public` schema.
-5. Stream the dump from R2 and load it.
-
-**At the prompt, type exactly:** `RESTORE` (uppercase), then press enter.
-
-Wait until you see:
-
-```
-✅ Restore complete.
-```
-
-## Step 7 — Verify the restore worked
-
-Still in the container:
-
+### Restore a SPECIFIC backup
+If you need to go back to a specific point in time, copy the key from the list command.
 ```bash
-psql "$DATABASE_URL" -c "\dt"
+./manage.sh restore backups/backup-2026-04-09_17-54.sql.gz
 ```
-
-This lists all tables — they should be the ones you expect.
-
-Spot-check a few row counts against what the backup should contain:
-
-```bash
-psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
-psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM <other-important-table>;"
-```
-
-If numbers look right, the restore succeeded.
-
-## Step 8 — Exit and bring the app back up
-
-Leave the container:
-
-```bash
-exit
-```
-
-Your prompt returns to `PS C:\...>`. You're back on Windows.
-
-If you put the app in maintenance mode, restart / unpause your app service(s) in the Railway dashboard and verify the app is healthy.
 
 ---
 
-## Troubleshooting quick reference
+## 💡 Manual/Local Restore (Alternative)
+If you have a backup file downloaded to your **local computer** and want to push it to a local Postgres instance (not Railway), use this command:
 
-| Problem | Fix |
-|---|---|
-| `export: The term 'export' is not recognized` | You're in PowerShell, not the container. Run `railway ssh` again — prompt should change to `root@...:/app#`. |
-| `Unable to redirect output to pager ... 'less'` | Run `export AWS_PAGER=""` before the script. |
-| `ERROR: object not found` | Typo in the dump key. Re-run `./list-backups.sh` and copy the key exactly. |
-| `ERROR: cannot detect format from filename` | Dump filename isn't `.sql`, `.sql.gz`, `.dump`, or `.dump.gz`. Rename in R2. |
-| `Could not connect to the endpoint URL ...s3.auto.amazonaws.com...` | `R2_ACCOUNT_ID` env var is wrong on the `db-restore` service. Fix in Variables tab. |
-| `password authentication failed` | `DATABASE_URL` on `db-restore` is stale. Check it references the right Postgres service. |
-| `railway ssh` says no deployments | The `db-restore` service isn't running. Check Deployments tab — if it crashed, check the logs. |
-| SSH session disconnects mid-restore | Reconnect with `railway ssh` and re-run. The schema drop is idempotent, so re-running is safe. |
+```bash
+gunzip -c backups_backup-2026-04-09_17-54.sql.gz | psql -U postgres -d pwrdesk_backup
+```
 
 ---
 
-## The whole thing in 6 commands
-
-Once you've done this once, the muscle memory is:
-
-```powershell
-railway login                         # Windows PowerShell
-railway ssh                           # (or paste the copied SSH command)
-export AWS_PAGER=""                   # now inside the container
-./list-backups.sh
-./restore.sh backups/<dump-key>       # type RESTORE when prompted
-psql "$DATABASE_URL" -c "\dt"
-```
-
-That's it. Keep this file in the `pwrdesk-db-restore` repo next to the scripts so you always know where to find it.
+## ⚠️ Troubleshooting
+* **Permission Denied**: If the scripts won't run inside the container, run `chmod +x *.sh`.
+* **Database is being accessed by other users**: If the script fails to drop the schema, ensure your app service is temporarily stopped or hibernated so it releases its connection.
+* **Connection Refused**: Double-check that your `DATABASE_URL` and R2 credentials are correctly set in the Railway service variables.
